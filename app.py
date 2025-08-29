@@ -18,12 +18,25 @@ from openai import OpenAI
 
 def get_client() -> OpenAI:
     """
-    Prefer local .env; fall back to Streamlit secrets in the cloud.
+    Prefer Streamlit Secrets in the cloud; fall back to local .env for dev.
     """
-    api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
+    # Streamlit Cloud injects secrets only on the server (never to the browser)
+    api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+
     if not api_key:
-        st.error("Missing OPENAI_API_KEY. Add it to a local .env or Streamlit Secrets.")
+        st.error(
+            "Missing **OPENAI_API_KEY**.\n\n"
+            "• For local dev: create a `.env` with OPENAI_API_KEY=...\n"
+            "• For Streamlit Cloud: App → Settings → **Secrets** → add OPENAI_API_KEY"
+        )
         st.stop()
+
+    # quick sanity check to catch accidental whitespace or wrong var
+    api_key = api_key.strip()
+    if not api_key.startswith(("sk-", "sk-proj-")):
+        st.error("Your OPENAI_API_KEY looks malformed. Double-check the value in Secrets/.env.")
+        st.stop()
+
     return OpenAI(api_key=api_key)
 
 
@@ -277,7 +290,7 @@ def _normalize_output(o: AnalysisOutput, raw_text: str) -> AnalysisOutput:
     return o
 
 
-# --- OpenAI call ---
+# --- OpenAI call (hardened for public deployment) ---
 def analyze_text_with_openai(raw_text: str) -> AnalysisOutput:
     client = get_client()
 
@@ -292,17 +305,27 @@ def analyze_text_with_openai(raw_text: str) -> AnalysisOutput:
         f"<<<\n{raw_text}\n>>>"
     )
 
-    resp = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.2,
-        max_tokens=800,  # allow room for longer paragraphs
-    )
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o",      # keep your model; switch to "gpt-4o-mini" if you want cheaper calls
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=800,  # allow room for longer paragraphs
+        )
+    except Exception as e:
+        # Surface auth/network issues nicely
+        msg = str(e)
+        if "401" in msg or "invalid_api_key" in msg.lower():
+            raise RuntimeError(
+                "OpenAI returned 401 (invalid_api_key). "
+                "On Streamlit Cloud, set **Settings → Secrets**: OPENAI_API_KEY."
+            )
+        raise
 
-    content = resp.choices[0].message.content.strip()
+    content = (resp.choices[0].message.content or "").strip()
 
     # Be resilient to tiny formatting hiccups
     try:
